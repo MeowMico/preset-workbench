@@ -1,0 +1,12 @@
+{
+  "display_name": "Preset Workbench",
+  "loading_order": 121,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "MeowMico",
+  "version": "0.1.0",
+  "homePage": "",
+  "auto_update": false
+}

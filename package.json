@@ -1,0 +1,19 @@
+{
+  "name": "preset-workbench",
+  "version": "0.1.0",
+  "description": "SillyTavern preset workbench with prompt editing, version history, rollback, annotations, and request console.",
+  "main": "index.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check index.js && node --check extension/index.js"
+  },
+  "keywords": [
+    "sillytavern",
+    "preset",
+    "prompt",
+    "backup",
+    "diff",
+    "versioning"
+  ]
+}
