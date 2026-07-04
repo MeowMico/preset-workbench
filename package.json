@@ -5,6 +5,7 @@
   "main": "index.js",
   "private": true,
   "license": "MIT",
+  "homepage": "https://github.com/MeowMico/preset-workbench",
   "scripts": {
     "check": "node --check index.js && node --check extension/index.js"
   },
