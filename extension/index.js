@@ -42,6 +42,7 @@ const app = {
   diffMode: 'current',
   dirty: false,
   rendering: false,
+  dragPromptId: '',
   consoleRecords: [],
   activeConsoleId: '',
 };
@@ -197,11 +198,11 @@ function ensureWorkbench() {
                     ${INJECTION_POSITIONS.map(item => `<option value="${item.value}">${item.label}</option>`).join('')}
                   </select>
                 </label>
-                <label>
+                <label class="pwb-depth-control">
                   <span>Depth</span>
                   <input id="pwb-prompt-depth" type="number" min="0">
                 </label>
-                <label>
+                <label class="pwb-order-control">
                   <span>Order</span>
                   <input id="pwb-prompt-order" type="number">
                 </label>
@@ -570,7 +571,9 @@ function renderPromptList() {
     list.replaceChildren(...records.map((record, index) => {
       const button = document.createElement('button');
       button.type = 'button';
+      button.draggable = true;
       button.className = `pwb-row pwb-prompt-row ${record.id === app.activePromptId ? 'active' : ''}`;
+      button.dataset.promptId = record.id;
       button.innerHTML = '<span></span><small></small>';
       button.querySelector('span').textContent = promptName(record.prompt);
       button.querySelector('small').textContent = [
@@ -584,6 +587,11 @@ function renderPromptList() {
         renderPromptList();
         renderPromptEditor();
       });
+      button.addEventListener('dragstart', event => handlePromptDragStart(event, record.id));
+      button.addEventListener('dragover', event => handlePromptDragOver(event, record.id));
+      button.addEventListener('dragleave', handlePromptDragLeave);
+      button.addEventListener('drop', event => handlePromptDrop(event, record.id));
+      button.addEventListener('dragend', handlePromptDragEnd);
       return button;
     }));
   }
@@ -617,6 +625,7 @@ function renderPromptEditor() {
     setInput(root, '#pwb-prompt-system', Boolean(prompt.system_prompt), disabled);
     setInput(root, '#pwb-prompt-marker', Boolean(prompt.marker), disabled);
     setInput(root, '#pwb-prompt-content', prompt.content || '', disabled || Boolean(prompt.marker));
+    renderPositionControls(root, prompt);
     root.querySelector('#pwb-raw-json').value = app.draftData ? JSON.stringify(app.draftData, null, 4) : '';
     root.querySelector('#pwb-raw-json').disabled = !app.draftData;
     root.querySelector('#pwb-apply-json').disabled = !app.draftData;
@@ -659,6 +668,7 @@ function updateActivePromptFromForm() {
   }
 
   markDirty('Prompt changed');
+  renderPositionControls(root, record.prompt);
   renderPromptList();
   renderActivePreset();
 }
@@ -675,16 +685,17 @@ function addPrompt() {
     system_prompt: false,
     marker: false,
     injection_position: 0,
-    injection_depth: 4,
-    injection_order: 100,
     injection_trigger: [],
   };
   app.draftData.prompts.push(prompt);
-  getGlobalPromptOrderGroup(app.draftData).order.push({ identifier: id, enabled: true });
+  const group = getGlobalPromptOrderGroup(app.draftData);
+  const activeIndex = group.order.findIndex(item => item.identifier === app.activePromptId);
+  group.order.splice(activeIndex >= 0 ? activeIndex + 1 : group.order.length, 0, { identifier: id, enabled: true });
   app.activePromptId = id;
   markDirty('Prompt added');
   renderPromptList();
   renderPromptEditor();
+  focusActivePromptName();
 }
 
 function duplicatePrompt() {
@@ -703,6 +714,7 @@ function duplicatePrompt() {
   markDirty('Prompt duplicated');
   renderPromptList();
   renderPromptEditor();
+  focusActivePromptName();
 }
 
 function deletePrompt() {
@@ -728,6 +740,82 @@ function moveActivePrompt(delta) {
   if (next < 0 || next >= group.order.length) return;
   const [item] = group.order.splice(index, 1);
   group.order.splice(next, 0, item);
+  markDirty('Prompt moved');
+  renderPromptList();
+}
+
+function renderPositionControls(root, prompt) {
+  const isAbsolute = Number(prompt?.injection_position || 0) === 1;
+  root.querySelectorAll('.pwb-depth-control, .pwb-order-control').forEach(element => {
+    element.classList.toggle('hidden', !isAbsolute);
+  });
+}
+
+function focusActivePromptName() {
+  window.requestAnimationFrame(() => {
+    const input = document.querySelector('#pwb-prompt-name');
+    if (!input || input.disabled) return;
+    input.focus();
+    input.select();
+  });
+}
+
+function handlePromptDragStart(event, id) {
+  app.dragPromptId = id;
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', id);
+  event.currentTarget.classList.add('dragging');
+}
+
+function handlePromptDragOver(event, targetId) {
+  if (!app.dragPromptId || app.dragPromptId === targetId) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  clearPromptDropClasses();
+  const rect = event.currentTarget.getBoundingClientRect();
+  const placement = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+  event.currentTarget.classList.add(placement === 'after' ? 'drop-after' : 'drop-before');
+}
+
+function handlePromptDragLeave(event) {
+  event.currentTarget.classList.remove('drop-before', 'drop-after');
+}
+
+function handlePromptDrop(event, targetId) {
+  if (!app.dragPromptId || app.dragPromptId === targetId) return;
+  event.preventDefault();
+  const rect = event.currentTarget.getBoundingClientRect();
+  const placement = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+  reorderPrompt(app.dragPromptId, targetId, placement);
+  handlePromptDragEnd();
+}
+
+function handlePromptDragEnd() {
+  app.dragPromptId = '';
+  clearPromptDropClasses({ includeDragging: true });
+}
+
+function clearPromptDropClasses({ includeDragging = false } = {}) {
+  document.querySelectorAll('#pwb-prompts .pwb-prompt-row').forEach(row => {
+    row.classList.remove('drop-before', 'drop-after');
+    if (includeDragging) row.classList.remove('dragging');
+  });
+}
+
+function reorderPrompt(dragId, targetId, placement) {
+  if (!app.draftData || dragId === targetId) return;
+  const group = getGlobalPromptOrderGroup(app.draftData);
+  const from = group.order.findIndex(item => item.identifier === dragId);
+  if (from < 0) return;
+  const [item] = group.order.splice(from, 1);
+  const target = group.order.findIndex(order => order.identifier === targetId);
+  if (target < 0) {
+    group.order.splice(from, 0, item);
+    return;
+  }
+  const insertAt = placement === 'after' ? target + 1 : target;
+  group.order.splice(insertAt, 0, item);
+  app.activePromptId = dragId;
   markDirty('Prompt moved');
   renderPromptList();
 }
