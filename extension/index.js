@@ -1,4 +1,9 @@
 const PLUGIN_ROOT = '/api/plugins/preset-workbench';
+const DB_NAME = 'preset-workbench';
+const DB_VERSION = 1;
+const SNAPSHOT_STORE = 'snapshots';
+const SNAPSHOT_TYPE = 'preset-workbench.snapshot';
+const SNAPSHOT_VERSION = 1;
 const DUMMY_CHARACTER_ID = 100000;
 const MAX_CONSOLE_RECORDS = 80;
 const ORIGINAL_FETCH = window.fetch.bind(window);
@@ -359,27 +364,38 @@ async function refreshWorkbench() {
   try {
     const status = await getJson('/status');
     app.serverAvailable = true;
-    app.apis = Array.isArray(status.apis) && status.apis.length ? status.apis : FALLBACK_APIS;
+    app.apis = mergeApis(Array.isArray(status.apis) && status.apis.length ? status.apis : FALLBACK_APIS, listNativeApis());
     if (!app.apis.some(api => api.id === app.activeApiId)) {
       app.activeApiId = app.apis[0]?.id || 'openai';
     }
   } catch (error) {
     app.serverAvailable = false;
-    setStatus(`Server plugin unavailable: ${error.message || error}`);
-    renderAll();
-    return;
+    app.apis = listNativeApis();
+    if (!app.apis.some(api => api.id === app.activeApiId)) {
+      app.activeApiId = app.apis[0]?.id || 'openai';
+    }
+    setStatus('Server history unavailable; reading presets from SillyTavern');
   }
 
   renderApiOptions();
   await loadPresets();
-  setStatus('Ready');
+  setStatus(app.serverAvailable ? 'Ready' : 'Ready (browser fallback)');
 }
 
 async function loadPresets() {
-  if (!app.serverAvailable && app.serverAvailable !== null) return;
   setStatus('Loading presets');
-  const result = await getJson(`/presets?apiId=${encodeURIComponent(app.activeApiId)}`);
-  app.presets = result.presets || [];
+  let serverPresets = [];
+  if (app.serverAvailable) {
+    try {
+      const result = await getJson(`/presets?apiId=${encodeURIComponent(app.activeApiId)}`);
+      serverPresets = (result.presets || []).map(preset => ({ ...preset, storage: 'server' }));
+    } catch (error) {
+      app.serverAvailable = false;
+      console.warn('[Preset Workbench] Server preset list failed; falling back to native manager.', error);
+      setStatus('Server preset list failed; using SillyTavern presets');
+    }
+  }
+  app.presets = mergePresetLists(serverPresets, listNativePresets(app.activeApiId));
 
   const nativeName = getNativeCurrentPresetName(app.activeApiId);
   app.activePreset = app.activePreset
@@ -408,9 +424,9 @@ async function loadActivePreset() {
   }
 
   setStatus(`Loading ${app.activePreset.name}`);
-  const result = await getJson(`/preset?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}`);
-  app.currentData = cloneValue(result.data || {});
-  app.draftData = cloneValue(result.data || {});
+  const data = await readPresetData(app.activeApiId, app.activePreset.name, app.activePreset);
+  app.currentData = cloneValue(data || {});
+  app.draftData = cloneValue(data || {});
   ensurePromptStructure(app.draftData);
   app.activePromptId = getOrderedPromptRecords(app.draftData)[0]?.id || '';
   populateDefaultSnapshotTags();
@@ -427,8 +443,18 @@ async function reloadActivePreset() {
 async function loadSnapshots() {
   if (!app.activePreset) return;
   const previousId = app.activeSnapshot?.id;
-  const result = await getJson(`/snapshots?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}`);
-  app.snapshots = result.snapshots || [];
+  let snapshots = [];
+  if (app.serverAvailable) {
+    try {
+      const result = await getJson(`/snapshots?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}`);
+      snapshots = snapshots.concat((result.snapshots || []).map(snapshot => ({ ...snapshot, storage: 'server' })));
+    } catch (error) {
+      app.serverAvailable = false;
+      console.warn('[Preset Workbench] Server snapshot list failed; using browser history.', error);
+    }
+  }
+  snapshots = mergeSnapshots(snapshots, await getLocalSnapshots(app.activeApiId, app.activePreset.name));
+  app.snapshots = snapshots;
   app.activeSnapshot = app.snapshots.find(snapshot => snapshot.id === previousId) || app.snapshots[0] || null;
   renderSnapshots();
   if (app.activeTab === 'diff') await renderDiff();
@@ -725,9 +751,10 @@ async function saveDraftPreset() {
   setStatus('Saving preset');
   const metadata = readSnapshotMetadata();
   try {
-    await postJson('/snapshots', {
+    await putSnapshotRecord({
       apiId: app.activeApiId,
       name: app.activePreset.name,
+      data: app.currentData || app.draftData,
       label: 'Before workbench save',
       reason: 'auto',
       skipDuplicate: true,
@@ -735,7 +762,7 @@ async function saveDraftPreset() {
 
     await writePresetThroughNativeOrServer(app.activeApiId, app.activePreset.name, app.draftData);
 
-    const result = await postJson('/snapshots', {
+    const result = await putSnapshotRecord({
       apiId: app.activeApiId,
       name: app.activePreset.name,
       data: app.draftData,
@@ -761,8 +788,17 @@ async function saveDraftPreset() {
 }
 
 async function loadPresetsAfterSave() {
-  const result = await getJson(`/presets?apiId=${encodeURIComponent(app.activeApiId)}`);
-  app.presets = result.presets || [];
+  let serverPresets = [];
+  if (app.serverAvailable) {
+    try {
+      const result = await getJson(`/presets?apiId=${encodeURIComponent(app.activeApiId)}`);
+      serverPresets = (result.presets || []).map(preset => ({ ...preset, storage: 'server' }));
+    } catch (error) {
+      app.serverAvailable = false;
+      console.warn('[Preset Workbench] Preset refresh after save failed; using native manager.', error);
+    }
+  }
+  app.presets = mergePresetLists(serverPresets, listNativePresets(app.activeApiId));
   app.activePreset = app.presets.find(preset => preset.name === app.activePreset?.name) || app.activePreset;
 }
 
@@ -789,7 +825,7 @@ async function createManualSnapshot() {
   setStatus('Creating snapshot');
   const metadata = readSnapshotMetadata();
   try {
-    const result = await postJson('/snapshots', {
+    const result = await putSnapshotRecord({
       apiId: app.activeApiId,
       name: app.activePreset.name,
       data: app.draftData,
@@ -880,15 +916,19 @@ async function editSnapshotLabel(snapshot) {
   if (modelTag === null) return;
   const cardTag = window.prompt('Card tag', snapshot.cardTag || '');
   if (cardTag === null) return;
-  await postJson('/snapshot/label', {
-    apiId: app.activeApiId,
-    name: app.activePreset.name,
-    file: snapshot.file,
-    label,
-    note,
-    modelTag,
-    cardTag,
-  });
+  if (snapshot.storage === 'browser') {
+    await updateLocalSnapshotLabel(snapshot.id, { label, note, modelTag, cardTag });
+  } else {
+    await postJson('/snapshot/label', {
+      apiId: app.activeApiId,
+      name: app.activePreset.name,
+      file: snapshot.file,
+      label,
+      note,
+      modelTag,
+      cardTag,
+    });
+  }
   await loadSnapshots();
 }
 
@@ -898,11 +938,20 @@ async function restoreSelectedSnapshot() {
   if (!ok) return;
   setStatus('Restoring');
   try {
-    await postJson('/restore', {
-      apiId: app.activeApiId,
-      name: app.activePreset.name,
-      file: app.activeSnapshot.file,
-    });
+    if (app.activeSnapshot.storage === 'browser') {
+      await putLocalSnapshot(app.activeApiId, app.activePreset.name, app.currentData || app.draftData, {
+        label: `Before restore ${formatDate(new Date().toISOString())}`,
+        reason: 'pre-restore',
+        skipDuplicate: false,
+      });
+      await writePresetThroughNativeOrServer(app.activeApiId, app.activePreset.name, app.activeSnapshot.data);
+    } else {
+      await postJson('/restore', {
+        apiId: app.activeApiId,
+        name: app.activePreset.name,
+        file: app.activeSnapshot.file,
+      });
+    }
     await loadActivePreset();
     const manager = getNativePresetManager(app.activeApiId);
     if (manager && typeof manager.updateList === 'function' && app.currentData) {
@@ -948,9 +997,7 @@ async function renderDiff() {
 
   setStatus('Comparing');
   try {
-    const data = app.diffMode === 'previous'
-      ? await getJson(`/compare-snapshots?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}&left=${encodeURIComponent(base.file)}&right=${encodeURIComponent(app.activeSnapshot.file)}`)
-      : await getJson(`/compare?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}&file=${encodeURIComponent(base.file)}`);
+    const data = await getDiffData(base, app.activeSnapshot);
 
     summary.textContent = `Prompts +${data.diff.summary.added} -${data.diff.summary.removed} ~${data.diff.summary.changed}; settings ~${data.diff.summary.settings}`;
     view.replaceChildren(...renderDiffNodes(data.diff));
@@ -1185,6 +1232,444 @@ function clearConsoleRecords() {
   app.consoleRecords = [];
   app.activeConsoleId = '';
   renderConsole();
+}
+
+function listNativeApis() {
+  const apis = FALLBACK_APIS.filter(api => getNativePresetManager(api.id));
+  return apis.length ? apis : FALLBACK_APIS;
+}
+
+function mergeApis(primary = [], fallback = []) {
+  const merged = new Map();
+  for (const api of [...fallback, ...primary]) {
+    if (api?.id) merged.set(api.id, api);
+  }
+  return [...merged.values()];
+}
+
+function listNativePresets(apiId) {
+  const manager = getNativePresetManager(apiId);
+  if (!manager || typeof manager.getPresetList !== 'function') return [];
+
+  try {
+    const { presets, preset_names: presetNames } = manager.getPresetList(apiId);
+    const names = Array.isArray(presetNames) ? presetNames : Object.keys(presetNames || {});
+    return names
+      .map((name) => {
+        const data = getNativePresetData(apiId, name);
+        if (!data) return null;
+        return {
+          ...summarizePresetData(apiId, name, data),
+          storage: 'native',
+          nativeOnly: true,
+          presetIndex: Array.isArray(presetNames) ? presetNames.indexOf(name) : presetNames?.[name],
+          loaded: Boolean(presets),
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => left.name.localeCompare(right.name));
+  } catch (error) {
+    console.warn('[Preset Workbench] Native preset list failed.', error);
+    return [];
+  }
+}
+
+function mergePresetLists(serverPresets = [], nativePresets = []) {
+  const merged = new Map();
+  for (const preset of serverPresets) {
+    if (!preset?.name) continue;
+    merged.set(preset.name, preset);
+  }
+  for (const preset of nativePresets) {
+    if (!preset?.name) continue;
+    merged.set(preset.name, {
+      ...(merged.get(preset.name) || {}),
+      ...preset,
+      storage: merged.has(preset.name) ? 'native+server' : 'native',
+      nativeOnly: !merged.has(preset.name),
+    });
+  }
+  return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function readPresetData(apiId, name, preset = null) {
+  const nativeData = getNativePresetData(apiId, name);
+  if (nativeData) return nativeData;
+
+  if (app.serverAvailable || preset?.storage === 'server') {
+    try {
+      const result = await getJson(`/preset?apiId=${encodeURIComponent(apiId)}&name=${encodeURIComponent(name)}`);
+      return result.data || {};
+    } catch (error) {
+      app.serverAvailable = false;
+      console.warn('[Preset Workbench] Server preset read failed; no native data was available.', error);
+    }
+  }
+
+  return {};
+}
+
+function getNativePresetData(apiId, name) {
+  const manager = getNativePresetManager(apiId);
+  if (!manager || typeof manager.getPresetList !== 'function') return null;
+
+  try {
+    const { presets, preset_names: presetNames } = manager.getPresetList(apiId);
+    let preset = null;
+    if (Array.isArray(presetNames)) {
+      const index = presetNames.findIndex(item => item === name);
+      if (index >= 0) preset = presets?.[index];
+    } else if (presetNames && Object.hasOwn(presetNames, name)) {
+      preset = presets?.[presetNames[name]];
+    }
+
+    if (!preset && cleanText(manager.getSelectedPresetName?.()) === name && typeof manager.getPresetSettings === 'function') {
+      preset = manager.getPresetSettings(name);
+    }
+
+    return preset && typeof preset === 'object' ? cloneValue(preset) : null;
+  } catch (error) {
+    console.warn('[Preset Workbench] Native preset read failed.', error);
+    return null;
+  }
+}
+
+function summarizePresetData(apiId, name, data) {
+  return {
+    apiId,
+    name,
+    file: `${name}.json`,
+    title: cleanText(data?.name) || name,
+    sourceHash: hashObject(data),
+    promptCount: countPrompts(data),
+    orderCount: getGlobalPromptOrder(data).length,
+    settingCount: data && typeof data === 'object' ? Object.keys(data).filter(key => key !== 'prompts' && key !== 'prompt_order').length : 0,
+    model: inferPresetModel(data),
+    chatCompletionSource: cleanText(data?.chat_completion_source),
+  };
+}
+
+async function putSnapshotRecord(payload) {
+  if (app.serverAvailable) {
+    try {
+      return await postJson('/snapshots', payload);
+    } catch (error) {
+      app.serverAvailable = false;
+      console.warn('[Preset Workbench] Server snapshot write failed; using browser history.', error);
+    }
+  }
+
+  const saved = await putLocalSnapshot(payload.apiId, payload.name, payload.data, payload);
+  return { ok: true, skipped: saved.skipped, snapshot: saved.snapshot };
+}
+
+async function putLocalSnapshot(apiId, name, data, options = {}) {
+  if (!data || typeof data !== 'object') {
+    throw new Error('Snapshot needs preset data.');
+  }
+
+  const hash = hashObject(data);
+  const existing = await getLocalSnapshots(apiId, name);
+  const latest = existing[0];
+  if (options.skipDuplicate && latest?.sourceHash === hash) {
+    return { skipped: true, snapshot: latest };
+  }
+
+  const now = new Date();
+  const file = `${formatDateForFile(now)}__${hash.slice(0, 10)}.json`;
+  const snapshot = {
+    type: SNAPSHOT_TYPE,
+    version: SNAPSHOT_VERSION,
+    id: `${apiId}:${name}:${file}`,
+    file,
+    storage: 'browser',
+    apiId,
+    presetName: name,
+    label: cleanText(options.label) || defaultSnapshotLabel(options.reason),
+    note: cleanText(options.note),
+    modelTag: cleanText(options.modelTag),
+    cardTag: cleanText(options.cardTag),
+    reason: cleanText(options.reason) || 'manual',
+    createdAt: now.toISOString(),
+    createdAtMs: now.getTime(),
+    sourceHash: hash,
+    promptCount: countPrompts(data),
+    orderCount: getGlobalPromptOrder(data).length,
+    data: cloneValue(data),
+  };
+
+  const db = await openDb();
+  await idbRequest(db.transaction(SNAPSHOT_STORE, 'readwrite').objectStore(SNAPSHOT_STORE).put(snapshot));
+  db.close();
+  return { skipped: false, snapshot };
+}
+
+async function getLocalSnapshots(apiId, name) {
+  try {
+    const db = await openDb();
+    const records = await idbRequest(db.transaction(SNAPSHOT_STORE, 'readonly').objectStore(SNAPSHOT_STORE).getAll());
+    db.close();
+    return sortSnapshots((records || [])
+      .filter(snapshot => snapshot?.apiId === apiId && snapshot?.presetName === name)
+      .map(snapshot => ({ ...snapshot, storage: 'browser' })));
+  } catch (error) {
+    console.warn('[Preset Workbench] Browser history read failed.', error);
+    return [];
+  }
+}
+
+async function updateLocalSnapshotLabel(id, { label, note, modelTag, cardTag }) {
+  const db = await openDb();
+  const snapshot = await idbRequest(db.transaction(SNAPSHOT_STORE, 'readonly').objectStore(SNAPSHOT_STORE).get(id));
+  if (!snapshot) {
+    db.close();
+    throw new Error('Local snapshot not found.');
+  }
+  snapshot.label = cleanText(label) || snapshot.label || '';
+  snapshot.note = cleanText(note);
+  snapshot.modelTag = cleanText(modelTag);
+  snapshot.cardTag = cleanText(cardTag);
+  snapshot.updatedAt = new Date().toISOString();
+  await idbRequest(db.transaction(SNAPSHOT_STORE, 'readwrite').objectStore(SNAPSHOT_STORE).put(snapshot));
+  db.close();
+}
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error('IndexedDB is not available.'));
+      return;
+    }
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(SNAPSHOT_STORE)) {
+        const store = db.createObjectStore(SNAPSHOT_STORE, { keyPath: 'id' });
+        store.createIndex('presetKey', ['apiId', 'presetName'], { unique: false });
+        store.createIndex('createdAtMs', 'createdAtMs', { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getDiffData(base, activeSnapshot) {
+  const canUseRemote = app.serverAvailable
+    && base?.storage !== 'browser'
+    && activeSnapshot?.storage !== 'browser';
+  if (canUseRemote) {
+    return app.diffMode === 'previous'
+      ? getJson(`/compare-snapshots?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}&left=${encodeURIComponent(base.file)}&right=${encodeURIComponent(activeSnapshot.file)}`)
+      : getJson(`/compare?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}&file=${encodeURIComponent(base.file)}`);
+  }
+
+  const left = await getSnapshotData(base);
+  const right = app.diffMode === 'previous'
+    ? await getSnapshotData(activeSnapshot)
+    : (app.draftData || app.currentData || {});
+  return {
+    ok: true,
+    diff: diffPresets(left, right),
+  };
+}
+
+async function getSnapshotData(snapshot) {
+  if (snapshot?.data) return snapshot.data;
+  if (!snapshot || snapshot.storage === 'browser') return {};
+  const result = await getJson(`/snapshot?apiId=${encodeURIComponent(app.activeApiId)}&name=${encodeURIComponent(app.activePreset.name)}&file=${encodeURIComponent(snapshot.file)}`);
+  return result.snapshot?.data || {};
+}
+
+function diffPresets(base, current) {
+  const promptEntries = diffPromptEntries(base, current);
+  const settingEntries = diffTopLevelSettings(base, current);
+  return {
+    summary: {
+      added: promptEntries.filter(x => x.status === 'added').length,
+      removed: promptEntries.filter(x => x.status === 'removed').length,
+      changed: promptEntries.filter(x => x.status === 'changed').length,
+      unchanged: promptEntries.filter(x => x.status === 'unchanged').length,
+      settings: settingEntries.length,
+    },
+    entries: promptEntries.filter(x => x.status !== 'unchanged'),
+    settings: settingEntries,
+  };
+}
+
+function diffPromptEntries(base, current) {
+  const basePrompts = normalizePromptRecordsForDiff(base);
+  const currentPrompts = normalizePromptRecordsForDiff(current);
+  const allIds = [...new Set([...Object.keys(basePrompts), ...Object.keys(currentPrompts)])]
+    .sort((left, right) => promptName(basePrompts[left]?.prompt || currentPrompts[left]?.prompt).localeCompare(promptName(basePrompts[right]?.prompt || currentPrompts[right]?.prompt)));
+
+  return allIds.map((id) => {
+    const before = basePrompts[id] || null;
+    const after = currentPrompts[id] || null;
+    if (!before) return { id, status: 'added', title: promptName(after.prompt), fields: [] };
+    if (!after) return { id, status: 'removed', title: promptName(before.prompt), fields: [] };
+    const fields = diffPromptFields(before, after);
+    return { id, status: fields.length ? 'changed' : 'unchanged', title: promptName(after.prompt), fields };
+  });
+}
+
+function normalizePromptRecordsForDiff(data) {
+  const clone = cloneValue(data || {});
+  ensurePromptStructure(clone);
+  return Object.fromEntries(getOrderedPromptRecords(clone).map(record => [record.id, record]));
+}
+
+function diffPromptFields(before, after) {
+  const fields = [
+    ['name', before.prompt?.name, after.prompt?.name],
+    ['role', before.prompt?.role, after.prompt?.role],
+    ['content', before.prompt?.content, after.prompt?.content],
+    ['enabled', before.order?.enabled, after.order?.enabled],
+    ['order', before.index, after.index],
+    ['injection_position', before.prompt?.injection_position, after.prompt?.injection_position],
+    ['injection_depth', before.prompt?.injection_depth, after.prompt?.injection_depth],
+    ['injection_order', before.prompt?.injection_order, after.prompt?.injection_order],
+    ['injection_trigger', before.prompt?.injection_trigger, after.prompt?.injection_trigger],
+    ['forbid_overrides', before.prompt?.forbid_overrides, after.prompt?.forbid_overrides],
+    ['system_prompt', before.prompt?.system_prompt, after.prompt?.system_prompt],
+    ['marker', before.prompt?.marker, after.prompt?.marker],
+  ];
+
+  return fields.map(([name, beforeValue, afterValue]) => {
+    const left = comparableField(beforeValue);
+    const right = comparableField(afterValue);
+    if (left === right) return null;
+    return {
+      name,
+      before: left,
+      after: right,
+      lines: name === 'content' ? diffLines(left, right) : [],
+    };
+  }).filter(Boolean);
+}
+
+function diffTopLevelSettings(base, current) {
+  const ignored = new Set(['prompts', 'prompt_order']);
+  const keys = [...new Set([
+    ...Object.keys(base || {}),
+    ...Object.keys(current || {}),
+  ])].filter(key => !ignored.has(key)).sort();
+
+  return keys.map((key) => {
+    const left = comparableField(base?.[key]);
+    const right = comparableField(current?.[key]);
+    if (left === right) return null;
+    return { name: key, before: left, after: right, lines: looksMultiline(left, right) ? diffLines(left, right) : [] };
+  }).filter(Boolean);
+}
+
+function diffLines(before, after) {
+  const a = String(before || '').split(/\r?\n/);
+  const b = String(after || '').split(/\r?\n/);
+  const table = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      table[i][j] = a[i] === b[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      rows.push({ type: 'same', text: a[i] });
+      i++;
+      j++;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      rows.push({ type: 'removed', text: a[i++] });
+    } else {
+      rows.push({ type: 'added', text: b[j++] });
+    }
+  }
+  while (i < a.length) rows.push({ type: 'removed', text: a[i++] });
+  while (j < b.length) rows.push({ type: 'added', text: b[j++] });
+  return rows;
+}
+
+function comparableField(value) {
+  if (Array.isArray(value)) return JSON.stringify(value);
+  if (value && typeof value === 'object') return stableStringify(value);
+  return value === undefined || value === null ? '' : String(value);
+}
+
+function looksMultiline(left, right) {
+  return String(left || '').includes('\n') || String(right || '').includes('\n');
+}
+
+function sortSnapshots(snapshots) {
+  return snapshots.sort((left, right) => Number(right.createdAtMs || 0) - Number(left.createdAtMs || 0));
+}
+
+function mergeSnapshots(primary = [], fallback = []) {
+  const merged = new Map();
+  for (const snapshot of [...fallback, ...primary]) {
+    if (!snapshot) continue;
+    merged.set(snapshot.id || snapshot.file, snapshot);
+  }
+  return sortSnapshots([...merged.values()]);
+}
+
+function defaultSnapshotLabel(reason) {
+  if (reason === 'auto') return 'Before workbench save';
+  if (reason === 'pre-restore') return 'Before restore';
+  return 'Manual snapshot';
+}
+
+function formatDateForFile(date) {
+  const pad = (value, size = 2) => String(value).padStart(size, '0');
+  return [
+    date.getFullYear(),
+    '-',
+    pad(date.getMonth() + 1),
+    '-',
+    pad(date.getDate()),
+    '_',
+    pad(date.getHours()),
+    '-',
+    pad(date.getMinutes()),
+    '-',
+    pad(date.getSeconds()),
+    '-',
+    pad(date.getMilliseconds(), 3),
+  ].join('');
+}
+
+function hashObject(value) {
+  const text = stableStringify(value);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function stableStringify(value) {
+  return JSON.stringify(sortValue(value));
+}
+
+function sortValue(value) {
+  if (Array.isArray(value)) return value.map(sortValue);
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((acc, key) => {
+      acc[key] = sortValue(value[key]);
+      return acc;
+    }, {});
+  }
+  return value;
 }
 
 function ensurePromptStructure(data) {

@@ -11,6 +11,7 @@ Preset Workbench 是一个 SillyTavern 预设工作台，用来编辑 Chat Compl
 - 支持选择历史版本并回滚；回滚前会自动创建 `Before restore` 快照。
 - 提供 diff 视图，对比当前文件或上一版本。
 - 提供生成请求控制台，捕获浏览器发出的生成请求 JSON，显示最终的 `messages` 或 `prompt` 格式。
+- 如果服务端插件 API 没有加载，会自动回退到 SillyTavern 前端原生 `PresetManager`，读取当前酒馆已经加载的 preset；此时历史版本会暂存在浏览器 IndexedDB。
 
 ## 安装
 
@@ -21,6 +22,8 @@ Preset Workbench 是一个 SillyTavern 预设工作台，用来编辑 Chat Compl
 ```text
 backups/preset-workbench/<apiId>/<presetName>/
 ```
+
+如果工作台打开后看不到 preset，先刷新 SillyTavern 页面，再确认顶部状态。如果显示 `Ready (browser fallback)`，说明服务端历史 API 没挂上，但工作台仍会从酒馆前端读取已加载的 preset。若仍为空，通常是当前 API 类型下没有原生 preset manager，或 SillyTavern 还没完成初始化。
 
 ## 说明
 
