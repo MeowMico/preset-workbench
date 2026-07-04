@@ -4,7 +4,9 @@ const DB_VERSION = 1;
 const SNAPSHOT_STORE = 'snapshots';
 const SNAPSHOT_TYPE = 'preset-workbench.snapshot';
 const SNAPSHOT_VERSION = 1;
-const DUMMY_CHARACTER_ID = 100000;
+// Chat Completion PromptManager uses 100001 for its global prompt order.
+const DUMMY_CHARACTER_ID = 100001;
+const LEGACY_DUMMY_CHARACTER_ID = 100000;
 const MAX_CONSOLE_RECORDS = 80;
 const ORIGINAL_FETCH = window.fetch.bind(window);
 
@@ -1694,6 +1696,7 @@ function getGlobalPromptOrderGroup(data) {
   if (!data || typeof data !== 'object') return { character_id: DUMMY_CHARACTER_ID, order: [] };
   if (!Array.isArray(data.prompt_order)) data.prompt_order = [];
   let group = data.prompt_order.find(item => String(item?.character_id) === String(DUMMY_CHARACTER_ID));
+  if (!group) group = data.prompt_order.find(item => String(item?.character_id) === String(LEGACY_DUMMY_CHARACTER_ID));
   if (!group) group = data.prompt_order.find(item => Array.isArray(item?.order));
   if (!group) {
     group = { character_id: DUMMY_CHARACTER_ID, order: [] };

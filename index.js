@@ -615,8 +615,9 @@ function normalizePromptRecords(data) {
 
 function getGlobalPromptOrder(data) {
   if (!Array.isArray(data?.prompt_order)) return [];
-  const preferred = data.prompt_order.find(item => String(item?.character_id) === '100000');
-  const group = preferred || data.prompt_order.find(item => Array.isArray(item?.order));
+  const preferred = data.prompt_order.find(item => String(item?.character_id) === '100001');
+  const legacy = data.prompt_order.find(item => String(item?.character_id) === '100000');
+  const group = preferred || legacy || data.prompt_order.find(item => Array.isArray(item?.order));
   return Array.isArray(group?.order) ? group.order : [];
 }
 
